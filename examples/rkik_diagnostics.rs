@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Access NTS-KE diagnostic information
             if let Some(ke_info) = client.nts_ke_info() {
                 println!("NTS-KE Diagnostics:");
-                println!("  NTP Server:      {}", ke_info.ntp_server);
+                println!("  NTP Server:      {:?}", ke_info.ntp_server);
                 println!("  AEAD Algorithm:  {}", ke_info.aead_algorithm);
                 println!("  KE Duration:     {:?}", ke_info.ke_duration);
                 println!("  Initial Cookies: {}", ke_info.initial_cookie_count);

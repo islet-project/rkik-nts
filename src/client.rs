@@ -10,7 +10,10 @@ use crate::config::NtsClientConfig;
 use crate::error::{Error, Result};
 use crate::nts_ke::perform_nts_ke;
 use crate::nts_ntp::NtsState;
-use crate::types::{CertificateInfo, TimeSnapshot};
+use crate::types::{CertificateInfo, NtpServerDestination, TimeSnapshot};
+
+#[cfg(feature = "vsock")]
+use crate::vsock_datagram_transport::VsockDatagramTransport;
 
 /// A high-level NTS (Network Time Security) client.
 ///
@@ -51,12 +54,13 @@ pub struct NtsClient {
     config: NtsClientConfig,
     /// NTS cryptographic state (ciphers and cookies).
     nts_state: Option<NtsState>,
-    /// UDP socket for NTP queries.
+    /// UDP socket for NTP queries (used in standard mode).
     socket: Option<UdpSocket>,
-    /// Primary NTP server address from NTS-KE.
-    ntp_server: Option<SocketAddr>,
-    /// All resolved NTP server addresses from NTS-KE.
-    ntp_servers: Vec<SocketAddr>,
+    /// VSOCK datagram transport (used when vsock_datagram_config is set).
+    #[cfg(feature = "vsock")]
+    vsock_datagram_transport: Option<VsockDatagramTransport>,
+    /// Primary NTP server destination from NTS-KE.
+    ntp_server_destination: Option<NtpServerDestination>,
     /// NTS-KE diagnostic information.
     ke_info: Option<NtsKeInfo>,
 }
@@ -65,8 +69,8 @@ pub struct NtsClient {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NtsKeInfo {
-    /// The NTP server address negotiated during NTS-KE.
-    pub ntp_server: SocketAddr,
+    /// The NTP server destination negotiated during NTS-KE.
+    pub ntp_server: NtpServerDestination,
     /// The negotiated AEAD algorithm.
     pub aead_algorithm: String,
     /// Duration of the NTS-KE handshake.
@@ -88,8 +92,9 @@ impl NtsClient {
             config,
             nts_state: None,
             socket: None,
-            ntp_server: None,
-            ntp_servers: Vec::new(),
+            #[cfg(feature = "vsock")]
+            vsock_datagram_transport: None,
+            ntp_server_destination: None,
             ke_info: None,
         }
     }
@@ -100,6 +105,9 @@ impl NtsClient {
     /// - AEAD algorithm
     /// - Client-to-server and server-to-client encryption keys
     /// - Initial pool of cookies
+    ///
+    /// Note, that the address resolution is deferred until `get_time()` is called.
+    /// This allows to delegate DNS resolution to vsock proxy.
     ///
     /// This must be called before querying time.
     ///
@@ -115,52 +123,70 @@ impl NtsClient {
         // Perform NTS key exchange
         let nts_result = perform_nts_ke(&self.config).await?;
 
-        let ntp_server = nts_result.ntp_server;
-        let ntp_servers = nts_result.ntp_server_addrs.clone();
+        let ntp_server_destination = nts_result.ntp_server.clone();
         let aead_algorithm = nts_result.aead_algorithm.clone();
         let ke_duration = nts_result.ke_duration();
         let certificate = nts_result.certificate.clone();
         let initial_cookie_count = nts_result.cookie_count();
 
         info!(
-            "NTS key exchange successful. NTP server: {}, cookies: {}",
-            ntp_server, initial_cookie_count
+            "NTS key exchange successful. NTP server: {:?}, cookies: {}",
+            ntp_server_destination, initial_cookie_count
         );
 
-        // Create UDP socket for NTP queries.
-        // Prefer IPv6 if any resolved address is IPv6; fall back to IPv4.
-        let socket = if ntp_servers.iter().any(SocketAddr::is_ipv6) {
-            match UdpSocket::bind("[::]:0").await {
-                Ok(socket) => socket,
-                Err(_) => UdpSocket::bind("0.0.0.0:0").await?,
-            }
-        } else {
-            UdpSocket::bind("0.0.0.0:0").await?
-        };
+        // Check if we're using vsock datagram mode
+        #[cfg(feature = "vsock")]
+        let using_vsock_datagram = self.config.vsock_datagram_config.is_some();
+        #[cfg(not(feature = "vsock"))]
+        let using_vsock_datagram = false;
 
-        // Discard addresses that don't match the bound socket's address family.
-        // Sending an IPv4 SocketAddr through an IPv6 socket (or vice versa) triggers
-        // EAFNOSUPPORT on every attempt, wasting cookies and retries.
-        let socket_is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
-        let ntp_servers: Vec<SocketAddr> = ntp_servers
-            .into_iter()
-            .filter(|a| a.is_ipv6() == socket_is_v6)
-            .collect();
-        if ntp_servers.is_empty() {
-            return Err(Error::ServerUnavailable(
-                "no NTP server addresses are compatible with the bound socket family".to_string(),
-            ));
+        if using_vsock_datagram {
+            // VSOCK datagram mode: create vsock datagram transport
+            #[cfg(feature = "vsock")]
+            {
+                if let Some(vsock_datagram_config) = &self.config.vsock_datagram_config {
+                    self.vsock_datagram_transport = Some(VsockDatagramTransport::new(
+                        vsock_datagram_config.cid,
+                        vsock_datagram_config.port,
+                        self.config.timeout,
+                    ));
+                    info!("Using VSOCK datagram transport for NTP packets");
+                }
+            }
+            // No UDP socket needed in vsock datagram mode
+            self.socket = None;
+
+            // Extract NTS state for authenticated queries
+            let nts_state = nts_result.into_nts_state();
+
+            self.nts_state = Some(nts_state);
+            self.ntp_server_destination = Some(ntp_server_destination.clone());
+            self.ke_info = Some(NtsKeInfo {
+                ntp_server: ntp_server_destination,
+                aead_algorithm,
+                ke_duration,
+                certificate,
+                initial_cookie_count,
+            });
+
+            return Ok(());
+        }
+
+        // Standard UDP mode: create UDP socket for NTP queries.
+        // Socket will be bound in get_time() when we know the address family.
+        self.socket = None;
+        #[cfg(feature = "vsock")]
+        {
+            self.vsock_datagram_transport = None;
         }
 
         // Extract NTS state for authenticated queries
         let nts_state = nts_result.into_nts_state();
 
-        self.socket = Some(socket);
         self.nts_state = Some(nts_state);
-        self.ntp_server = Some(ntp_server);
-        self.ntp_servers = ntp_servers;
+        self.ntp_server_destination = Some(ntp_server_destination.clone());
         self.ke_info = Some(NtsKeInfo {
-            ntp_server,
+            ntp_server: ntp_server_destination,
             aead_algorithm,
             ke_duration,
             certificate,
@@ -207,23 +233,13 @@ impl NtsClient {
     /// # }
     /// ```
     pub async fn get_time(&mut self) -> Result<TimeSnapshot> {
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or_else(|| Error::Other("Not connected. Call connect() first.".to_string()))?;
-
         let nts_state = self.nts_state.as_mut().ok_or_else(|| {
             Error::Other("No NTS state available. Call connect() first.".to_string())
         })?;
 
-        let ntp_server = self.ntp_server.ok_or_else(|| {
+        let ntp_server_destination = self.ntp_server_destination.as_ref().ok_or_else(|| {
             Error::Other("No NTP server configured. Call connect() first.".to_string())
         })?;
-        if self.ntp_servers.is_empty() {
-            return Err(Error::Other(
-                "No NTP server addresses resolved. Call connect() first.".to_string(),
-            ));
-        }
 
         // Check if we have cookies available
         if !nts_state.has_cookies() {
@@ -235,17 +251,239 @@ impl NtsClient {
             nts_state.cookie_count()
         );
 
+        #[cfg(feature = "vsock")]
+        let using_vsock_datagram = self.vsock_datagram_transport.is_some();
+        #[cfg(not(feature = "vsock"))]
+        let using_vsock_datagram = false;
+
+        // Use the vsock datagram mode
+        if using_vsock_datagram {
+            #[cfg(feature = "vsock")]
+            {
+                let server_info = match ntp_server_destination {
+                    NtpServerDestination::Hostname(info) => info,
+                    NtpServerDestination::SocketAddr(_) => {
+                        return Err(Error::Other(
+                            "VSOCK datagram mode requires hostname-based server config".to_string(),
+                        ));
+                    }
+                };
+
+                if let Some(transport) = &self.vsock_datagram_transport {
+                    return Self::send_ntp_requests_vsock_datagram_mode(
+                        transport,
+                        nts_state,
+                        server_info,
+                        self.config.max_retries,
+                        self.config.timeout,
+                        ntp_server_destination,
+                    ).await;
+                } else {
+                    return Err(Error::Other(
+                        "VSOCK datagram transport not initialized".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Standard UDP mode: resolve server addresses and create socket if needed
+        let ntp_addrs = match ntp_server_destination {
+            NtpServerDestination::SocketAddr(addr) => vec![*addr],
+            #[cfg(feature = "vsock")]
+            NtpServerDestination::Hostname(info) => {
+                crate::transport::resolve_server(&info.hostname, info.port, self.config.timeout).await?
+            }
+            #[cfg(not(feature = "vsock"))]
+            NtpServerDestination::Hostname(info) => {
+                crate::transport::resolve_server(&info.hostname, info.port, self.config.timeout).await?
+            }
+        };
+
+        if ntp_addrs.is_empty() {
+            return Err(Error::ServerUnavailable(
+                "No NTP server addresses resolved".to_string(),
+            ));
+        }
+
+        // Create or reuse UDP socket
+        // Prefer IPv6 if any resolved address is IPv6; fall back to IPv4.
+        if self.socket.is_none() {
+            let socket = if ntp_addrs.iter().any(SocketAddr::is_ipv6) {
+                match UdpSocket::bind("[::]:0").await {
+                    Ok(socket) => socket,
+                    Err(_) => UdpSocket::bind("0.0.0.0:0").await?,
+                }
+            } else {
+                UdpSocket::bind("0.0.0.0:0").await?
+            };
+
+            // Discard addresses that don't match the bound socket's address family.
+            let socket_is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+            let filtered_addrs: Vec<SocketAddr> = ntp_addrs
+                .into_iter()
+                .filter(|a| a.is_ipv6() == socket_is_v6)
+                .collect();
+
+            if filtered_addrs.is_empty() {
+                return Err(Error::ServerUnavailable(
+                    "no NTP server addresses are compatible with the bound socket family".to_string(),
+                ));
+            }
+
+            self.socket = Some(socket);
+            // Store filtered addresses for use in the retry loop
+            // We use a local variable since we don't store addresses in the struct anymore
+            return Self::send_ntp_requests_standard_mode(
+                self.socket.as_ref().unwrap(),
+                nts_state,
+                &filtered_addrs,
+                self.config.max_retries,
+                self.config.timeout,
+                ntp_server_destination,
+            ).await;
+        }
+
+        let socket = self.socket.as_ref().unwrap();
+
+        // Filter addresses to match socket family
+        let socket_is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let filtered_addrs: Vec<SocketAddr> = ntp_addrs
+            .into_iter()
+            .filter(|a| a.is_ipv6() == socket_is_v6)
+            .collect();
+
+        if filtered_addrs.is_empty() {
+            return Err(Error::ServerUnavailable(
+                "no NTP server addresses are compatible with the bound socket family".to_string(),
+            ));
+        }
+
+        Self::send_ntp_requests_standard_mode(
+            socket,
+            nts_state,
+            &filtered_addrs,
+            self.config.max_retries,
+            self.config.timeout,
+            ntp_server_destination,
+        ).await
+    }
+
+    /// Send NTP requests in VSOCK datagram mode with retry logic.
+    #[cfg(feature = "vsock")]
+    async fn send_ntp_requests_vsock_datagram_mode(
+        transport: &VsockDatagramTransport,
+        nts_state: &mut NtsState,
+        server_info: &crate::config::NtpServerInfo,
+        max_retries: u32,
+        op_timeout: std::time::Duration,
+        _ntp_server_destination: &NtpServerDestination,
+    ) -> Result<TimeSnapshot> {
         let mut last_error = None;
-        let max_attempts = self
-            .config
-            .max_retries
-            .saturating_add(1)
-            .max(self.ntp_servers.len() as u32);
+        let max_attempts = max_retries.saturating_add(1);
         let mut nts_response = None;
 
         for attempt in 0..max_attempts {
             let request = nts_state.create_request()?;
-            let target = self.ntp_servers[attempt as usize % self.ntp_servers.len()];
+
+            debug!(
+                "Sending NTS request attempt {} ({} bytes) via VSOCK datagram to {}:{}",
+                attempt + 1,
+                request.len(),
+                server_info.hostname,
+                server_info.port
+            );
+
+            let response = match tokio::time::timeout(op_timeout, transport.send_to(server_info, &request)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    nts_state.abandon_request();
+                    last_error = Some(err);
+                    continue;
+                }
+                Err(_) => {
+                    nts_state.abandon_request();
+                    last_error = Some(Error::Timeout);
+                    continue;
+                }
+            };
+
+            debug!("Received {} bytes response via VSOCK datagram", response.len());
+
+            match nts_state.parse_response(&response) {
+                Ok(response) => {
+                    nts_response = Some(response);
+                    break;
+                }
+                Err(
+                    err @ Error::InvalidResponse(_)
+                    | err @ Error::MissingAuthenticator
+                    | err @ Error::AeadVerificationFailed(_)
+                    | err @ Error::MalformedNtsExtension(_)
+                    | err @ Error::KissOfDeath(_),
+                ) => {
+                    debug!("Discarding invalid NTS response: {}", err);
+                    nts_state.abandon_request();
+                    last_error = Some(err);
+                    continue;
+                }
+                Err(err) => {
+                    nts_state.abandon_request();
+                    last_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let nts_response = match nts_response {
+            Some(response) => response,
+            None => return Err(last_error.unwrap_or(Error::Timeout)),
+        };
+
+        debug!(
+            "NTS response verified. Stratum: {}, authenticated: {}, cookies remaining: {}",
+            nts_response.stratum,
+            nts_response.authenticated,
+            nts_state.cookie_count()
+        );
+
+        // Warn if cookie count is getting low
+        if nts_state.needs_more_cookies() {
+            warn!(
+                "Cookie count is low ({}). Consider reconnecting if queries fail.",
+                nts_state.cookie_count()
+            );
+        }
+
+        // Convert NtsResponse to TimeSnapshot
+        let offset = nts_response.offset();
+        let server_str = format!("{}:{}", server_info.hostname, server_info.port);
+
+        Ok(TimeSnapshot {
+            system_time: nts_response.system_time,
+            network_time: nts_response.network_time,
+            offset,
+            round_trip_delay: nts_response.round_trip_delay,
+            server: server_str,
+            authenticated: nts_response.authenticated,
+        })
+    }
+
+    /// Send NTP requests in standard UDP mode with retry logic.
+    async fn send_ntp_requests_standard_mode(
+        socket: &UdpSocket,
+        nts_state: &mut NtsState,
+        ntp_addrs: &[SocketAddr],
+        max_retries: u32,
+        op_timeout: std::time::Duration,
+        ntp_server_destination: &NtpServerDestination,
+    ) -> Result<TimeSnapshot> {
+        let mut last_error = None;
+        let max_attempts = max_retries.saturating_add(1).max(ntp_addrs.len() as u32);
+        let mut nts_response = None;
+
+        for attempt in 0..max_attempts {
+            let request = nts_state.create_request()?;
+            let target = ntp_addrs[attempt as usize % ntp_addrs.len()];
 
             debug!(
                 "Sending NTS request attempt {} ({} bytes) to {}",
@@ -260,7 +498,7 @@ impl NtsClient {
                 continue;
             }
 
-            let deadline = tokio::time::Instant::now() + self.config.timeout;
+            let deadline = tokio::time::Instant::now() + op_timeout;
             let mut buf = vec![0u8; 2048];
             let mut attempt_error = Error::Timeout;
 
@@ -340,24 +578,48 @@ impl NtsClient {
         // Convert NtsResponse to TimeSnapshot
         let offset = nts_response.offset();
 
+        // Get server string for the snapshot
+        let server_str = match ntp_server_destination {
+            NtpServerDestination::SocketAddr(addr) => addr.to_string(),
+            NtpServerDestination::Hostname(info) => format!("{}:{}", info.hostname, info.port),
+        };
+
         Ok(TimeSnapshot {
             system_time: nts_response.system_time,
             network_time: nts_response.network_time,
             offset,
             round_trip_delay: nts_response.round_trip_delay,
-            server: ntp_server.to_string(),
+            server: server_str,
             authenticated: nts_response.authenticated,
         })
     }
 
     /// Check if the client is connected and ready to query time.
     pub fn is_connected(&self) -> bool {
-        self.socket.is_some() && self.nts_state.is_some()
+        self.nts_state.is_some() && self.has_transport()
     }
 
-    /// Get the NTP server address being used.
+    /// Check if we have a transport available.
+    #[cfg(feature = "vsock")]
+    fn has_transport(&self) -> bool {
+        self.socket.is_some() || self.vsock_datagram_transport.is_some()
+    }
+
+    #[cfg(not(feature = "vsock"))]
+    fn has_transport(&self) -> bool {
+        self.socket.is_some()
+    }
+
+    /// Get the NTP server destination being used.
+    pub fn ntp_server_destination(&self) -> Option<&NtpServerDestination> {
+        self.ntp_server_destination.as_ref()
+    }
+
+    /// Get the NTP server address being used (if in standard UDP mode).
     pub fn ntp_server(&self) -> Option<SocketAddr> {
-        self.ntp_server
+        self.ntp_server_destination
+            .as_ref()
+            .and_then(|d| d.as_socket_addr())
     }
 
     /// Get the current cookie count.
@@ -404,9 +666,12 @@ impl NtsClient {
     pub async fn reconnect(&mut self) -> Result<()> {
         debug!("Reconnecting to NTS server");
         self.socket = None;
+        #[cfg(feature = "vsock")]
+        {
+            self.vsock_datagram_transport = None;
+        }
         self.nts_state = None;
-        self.ntp_server = None;
-        self.ntp_servers.clear();
+        self.ntp_server_destination = None;
         self.ke_info = None;
         self.connect().await
     }

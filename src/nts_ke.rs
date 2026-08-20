@@ -3,10 +3,14 @@
 //! This module implements the NTS-KE handshake directly over TLS 1.3 with
 //! the `"ntske/1"` ALPN identifier.  Keys are derived from the TLS session
 //! via RFC 5705 keying-material export.
+//!
+//! The transport layer supports both TCP and VSOCK stream. When VSOCK is configured
+//! via `NtsClientConfig::vsock_config`, the key exchange will be performed
+//! over VSOCK instead of TCP. This is useful for VM-to-host communication
+//! where TCP/IP networking is disabled.
 
 #[cfg(feature = "tls-keylog")]
 use std::io::Write;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use rustls::pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime};
@@ -18,7 +22,12 @@ use zeroize::Zeroizing;
 use crate::cipher::{AeadCipher, AEAD_AES_SIV_CMAC_256, AEAD_AES_SIV_CMAC_512};
 use crate::config::NtsClientConfig;
 use crate::error::{Error, Result};
-use crate::types::{CertificateInfo, NtsKeResult};
+use crate::types::{CertificateInfo, NtsKeResult, NtpServerDestination};
+use crate::transport::establish_transport;
+
+#[cfg(feature = "vsock")]
+use crate::config::NtpServerConfig;
+use crate::config::NtpServerInfo;
 
 const NTPV4_PROTOCOL_ID: u16 = 0;
 const NTS_KE_MAX_RECORDS: usize = 1024;
@@ -40,41 +49,25 @@ struct NtsKeParseState {
 /// Opens a TLS 1.3 connection to the NTS-KE server with ALPN `"ntske/1"`,
 /// exchanges NTS-KE records, and derives the c2s/s2c cipher keys from the
 /// TLS session via RFC 5705 keying material export.
+///
+/// The transport layer is determined by the configuration:
+/// - If `config.vsock_config` is set, VSOCK transport is used
+/// - Otherwise, TCP transport is used
 pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResult> {
     let ke_start = std::time::Instant::now();
 
-    info!(
-        "Starting NTS-KE with {}:{}",
-        config.nts_ke_server, config.nts_ke_port
-    );
+    #[cfg(feature = "vsock")]
+    let transport_type = if config.vsock_config.is_some() { "VSOCK" } else { "TCP" };
+    #[cfg(not(feature = "vsock"))]
+    let transport_type = "TCP";
 
-    let server_addrs =
-        resolve_server(&config.nts_ke_server, config.nts_ke_port, config.timeout).await?;
-    debug!("Resolved NTS-KE server addresses: {server_addrs:?}");
+    info!(
+        "Starting NTS-KE with {}:{} (transport: {})",
+        config.nts_ke_server, config.nts_ke_port, transport_type
+    );
 
     let (tls_config, captured_certs) = build_tls_config(config)?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-
-    let mut last_connect_error = None;
-    let mut tcp_stream = None;
-    for server_addr in &server_addrs {
-        match tokio::time::timeout(config.timeout, tokio::net::TcpStream::connect(server_addr))
-            .await
-        {
-            Ok(Ok(stream)) => {
-                tcp_stream = Some(stream);
-                break;
-            }
-            Ok(Err(err)) => last_connect_error = Some(err.to_string()),
-            Err(_) => last_connect_error = Some(format!("timed out connecting to {server_addr}")),
-        }
-    }
-    let tcp_stream = tcp_stream.ok_or_else(|| {
-        Error::ServerUnavailable(
-            last_connect_error
-                .unwrap_or_else(|| "unable to connect to any resolved address".to_string()),
-        )
-    })?;
 
     let server_name = rustls::pki_types::ServerName::try_from(config.nts_ke_server.as_str())
         .map_err(|e| {
@@ -85,8 +78,12 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
         })?
         .to_owned();
 
+    // Establish transport connection (TCP or VSOCK)
+    let transport_stream = establish_transport(config).await?;
+
+    // Perform TLS handshake over the transport
     let mut tls_stream =
-        tokio::time::timeout(config.timeout, connector.connect(server_name, tcp_stream))
+        tokio::time::timeout(config.timeout, connector.connect(server_name, transport_stream))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Tls(format!("TLS handshake failed: {e}")))?;
@@ -353,20 +350,37 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
         }
     };
 
-    // Determine the NTP server and port to use.
-    let (ntp_server_addr, ntp_server_addrs) = if let Some(addr) = config.ntp_server {
-        (addr, vec![addr])
-    } else {
+    fn extract_ntp_server_from_state(state: &NtsKeParseState, nts_ke_server: &str) -> NtpServerDestination {
         let ntp_host = state
             .ntp_server
             .clone()
-            .unwrap_or_else(|| config.nts_ke_server.clone());
+            .unwrap_or_else(|| nts_ke_server.to_string());
         let ntp_port = state.ntp_port.unwrap_or(123);
-        let addrs = resolve_server(&ntp_host, ntp_port, config.timeout).await?;
-        let primary = *addrs.first().ok_or_else(|| {
-            Error::ServerUnavailable("No NTP server addresses resolved".to_string())
-        })?;
-        (primary, addrs)
+        NtpServerDestination::Hostname(NtpServerInfo::new(ntp_host, ntp_port))
+    }
+
+    // Address resolution is deferred until get_time() is called.
+    // This allows the vsock proxy to handle DNS resolution when needed.
+    #[cfg(feature = "vsock")]
+    let ntp_server_destination = if let Some(server_config) = &config.ntp_server {
+        // Use the configured server
+        match server_config {
+            NtpServerConfig::SocketAddr(addr) => {
+                NtpServerDestination::SocketAddr(*addr)
+            }
+            NtpServerConfig::Hostname(info) => {
+                NtpServerDestination::Hostname(info.clone())
+            }
+        }
+    } else {
+        extract_ntp_server_from_state(&state, &config.nts_ke_server)
+    };
+
+    #[cfg(not(feature = "vsock"))]
+    let ntp_server_destination = if let Some(addr) = config.ntp_server {
+        NtpServerDestination::SocketAddr(addr)
+    } else {
+        extract_ntp_server_from_state(&state, &config.nts_ke_server)
     };
 
     let aead_algorithm = match alg_id {
@@ -376,13 +390,13 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
     };
 
     info!(
-        "NTS-KE successful. NTP server: {ntp_server_addr}, algorithm: {aead_algorithm}, cookies: {}",
+        "NTS-KE successful. NTP server: {:?}, algorithm: {aead_algorithm}, cookies: {}",
+        ntp_server_destination,
         state.cookies.len()
     );
 
     Ok(NtsKeResult {
-        ntp_server: ntp_server_addr,
-        ntp_server_addrs,
+        ntp_server: ntp_server_destination,
         aead_algorithm,
         cookies: state.cookies,
         ke_duration,
@@ -481,6 +495,74 @@ fn extract_certificate_info(certs: &[CertificateDer<'_>]) -> Option<CertificateI
     })
 }
 
+/// A custom certificate verifier that pins specific certificates.
+///
+/// This verifier accepts the server's certificate if it matches any of the
+/// pinned certificates by exact byte comparison. All other verification
+/// (signature, chain, etc.) is bypassed - this is intentional for pinning.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    pinned_certs: Vec<CertificateDer<'static>>,
+}
+
+impl PinnedCertVerifier {
+    fn new(pinned_certs: Vec<CertificateDer<'static>>) -> Self {
+        Self { pinned_certs }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &RustlsServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Check if the server's certificate matches any of our pinned certificates
+        for pinned in &self.pinned_certs {
+            if end_entity.as_ref() == pinned.as_ref() {
+                debug!("Certificate pinning verification successful");
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+        }
+
+        // Certificate doesn't match any pinned certificate
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // When using certificate pinning, we trust the pinned certificate completely
+        // Signature verification is bypassed since the certificate itself is trusted
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // When using certificate pinning, we trust the pinned certificate completely
+        // Signature verification is bypassed since the certificate itself is trusted
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Custom certificate verifier that captures the certificate chain
 #[derive(Debug)]
 struct CapturingVerifier {
@@ -535,12 +617,49 @@ impl rustls::client::danger::ServerCertVerifier for CapturingVerifier {
     }
 }
 
+/// Load pinned certificates from the given paths.
+///
+/// # Arguments
+///
+/// * `cert_paths` - Slice of paths to PEM-encoded certificate files.
+///
+/// # Returns
+///
+/// A vector of `CertificateDer` certificates loaded from the given paths.
+fn load_pinned_certs(cert_paths: &[std::path::PathBuf]) -> Result<Vec<CertificateDer<'static>>> {
+    let mut certs = Vec::new();
+
+    for path in cert_paths {
+        // Read the entire file at once (consistent with load_root_certs)
+        let cert_data = std::fs::read(path)
+            .map_err(|e| Error::Tls(format!("Failed to read pinned cert {:?}: {e}", path)))?;
+
+        // Parse PEM certificates from the file data
+        let parsed_certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Tls(format!("Failed to parse pinned cert {:?}: {e}", path)))?;
+
+        for cert in parsed_certs {
+            certs.push(cert);
+        }
+    }
+
+    if certs.is_empty() {
+        return Err(Error::Tls("No certificates found in pinned cert files".to_string()));
+    }
+
+    Ok(certs)
+}
+
 /// Build a `rustls::ClientConfig` for NTS-KE.
 ///
 /// The configuration enforces TLS 1.3 and sets the ALPN protocol to
 /// `"ntske/1"` as required by RFC 8915 §4. A [`CapturingVerifier`] is
 /// layered on top of the real verifier so that the peer certificate chain
 /// can be surfaced in [`NtsKeResult`].
+///
+/// Note, that if `config.pinned_certs` is set, certificate pinning is used instead of
+/// standard CA-based verification.
 fn build_tls_config(
     config: &NtsClientConfig,
 ) -> Result<(
@@ -552,24 +671,34 @@ fn build_tls_config(
 
     let captured_certs = Arc::new(Mutex::new(Vec::new()));
 
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if config.verify_tls_cert {
-        let roots = load_root_certs();
-        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-            .build()
-            .map_err(|e| Error::Tls(format!("Failed to build TLS verifier: {e}")))?;
-        Arc::new(CapturingVerifier {
-            inner,
-            captured_certs: captured_certs.clone(),
-        })
-    } else {
-        warn!("TLS certificate verification is disabled!");
-        Arc::new(CapturingVerifier {
-            inner: Arc::new(NoVerification {
-                provider: rustls::crypto::ring::default_provider().into(),
-            }),
-            captured_certs: captured_certs.clone(),
-        })
-    };
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        if let Some(pinned_cert_paths) = &config.pinned_certs {
+            info!("Using certificate pinning with {} cert file(s)", pinned_cert_paths.len());
+            let pinned_certs = load_pinned_certs(pinned_cert_paths)?;
+            let pinned_verifier = PinnedCertVerifier::new(pinned_certs);
+            Arc::new(CapturingVerifier {
+                inner: Arc::new(pinned_verifier),
+                captured_certs: captured_certs.clone(),
+            })
+        } else if config.verify_tls_cert {
+            let roots = load_root_certs(config);
+            let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| Error::Tls(format!("Failed to build TLS verifier: {e}")))?;
+            Arc::new(CapturingVerifier {
+                inner,
+                captured_certs: captured_certs.clone(),
+            })
+        } else {
+            // Disable all certificate verification (dangerous!)
+            warn!("TLS certificate verification is disabled!");
+            Arc::new(CapturingVerifier {
+                inner: Arc::new(NoVerification {
+                    provider: rustls::crypto::ring::default_provider().into(),
+                }),
+                captured_certs: captured_certs.clone(),
+            })
+        };
 
     let mut tls_config =
         rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -589,8 +718,8 @@ fn build_tls_config(
 }
 
 /// Load root certificates from the OS trust store, supplemented by the
-/// embedded Mozilla root set from `webpki-roots`.
-fn load_root_certs() -> rustls::RootCertStore {
+/// embedded Mozilla root set from `webpki-roots` and any custom CA certificates.
+fn load_root_certs(config: &NtsClientConfig) -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
 
     let native = rustls_native_certs::load_native_certs();
@@ -606,6 +735,31 @@ fn load_root_certs() -> rustls::RootCertStore {
     // Add the Mozilla root set as a fallback (covers cases where the OS
     // trust store is empty or unavailable).
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Add custom CA certificates from the configuration
+    for ca_path in &config.additional_ca_certs {
+        match std::fs::read(ca_path) {
+            Ok(cert_data) => {
+                let parsed_certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+                    .collect();
+                for cert_result in parsed_certs {
+                    match cert_result {
+                        Ok(cert) => {
+                            if let Err(e) = roots.add(cert) {
+                                warn!("Failed to add custom CA cert from {:?}: {e}", ca_path);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse certificate from {:?}: {e}", ca_path);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read custom CA cert from {:?}: {e}", ca_path);
+            }
+        }
+    }
 
     roots
 }
@@ -680,32 +834,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerification {
     }
 }
 
-/// Resolve server address
-async fn resolve_server(
-    server: &str,
-    port: u16,
-    timeout: std::time::Duration,
-) -> Result<Vec<SocketAddr>> {
-    if let Ok(addr) = format!("{server}:{port}").parse::<SocketAddr>() {
-        return Ok(vec![addr]);
-    }
-
-    let addrs = tokio::time::timeout(timeout, tokio::net::lookup_host((server, port)))
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|e| Error::ServerUnavailable(format!("DNS resolution failed: {e}")))?;
-
-    let mut resolved: Vec<_> = addrs.collect();
-    resolved.sort_unstable();
-    resolved.dedup();
-    if resolved.is_empty() {
-        return Err(Error::ServerUnavailable(
-            "No addresses resolved".to_string(),
-        ));
-    }
-    Ok(resolved)
-}
-
 /// KeyLog handler for writing TLS secrets to file (for Wireshark decryption)
 #[cfg(feature = "tls-keylog")]
 #[derive(Debug)]
@@ -754,6 +882,7 @@ where
 
     let body_len = u16::try_from(body.len())
         .map_err(|_| Error::Protocol("NTS-KE record body exceeds 65535 bytes".to_string()))?;
+
     let type_bytes = type_id.to_be_bytes();
     let len_bytes = body_len.to_be_bytes();
     let critical_bit: u8 = if critical { 0x80 } else { 0x00 };

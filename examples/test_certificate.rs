@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(ke_info) = client.nts_ke_info() {
                 println!("NTS-KE handshake successful!");
-                println!("NTP Server: {}", ke_info.ntp_server);
+                println!("NTP Server: {:?}", ke_info.ntp_server);
                 println!("AEAD Algorithm: {}", ke_info.aead_algorithm);
                 println!("Initial cookies: {}", ke_info.initial_cookie_count);
                 println!("Handshake duration: {:?}", ke_info.ke_duration);
