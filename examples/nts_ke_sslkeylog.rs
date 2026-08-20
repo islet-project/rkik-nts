@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             if let Some(ke_info) = client.nts_ke_info() {
                 println!("Informations NTS-KE :");
-                println!("  Serveur NTP :     {}", ke_info.ntp_server);
+                println!("  Serveur NTP :     {:?}", ke_info.ntp_server);
                 println!("  Algorithme AEAD : {}", ke_info.aead_algorithm);
                 println!("  Durée KE :        {:?}", ke_info.ke_duration);
                 println!("  Cookies :         {}", ke_info.initial_cookie_count);

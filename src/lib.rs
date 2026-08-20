@@ -18,6 +18,8 @@
 //! - **Async/Await**: Built on Tokio for efficient async I/O
 //! - **Configurable**: Flexible configuration options for advanced use cases
 //! - **Self-contained RFC 8915 implementation**: NTS-KE and NTS-protected NTP implemented directly in this crate
+//! - **VSOCK Support**: Optional VSOCK transport for VM-to-host communication without TCP/IP
+//! - **VSOCK Datagram Proxy**: Support for sending NTP packets over VSOCK to a proxy that handles UDP forwarding
 //!
 //! ## Security
 //!
@@ -72,6 +74,28 @@
 //!     .with_max_retries(3);
 //! ```
 //!
+//! ## VSOCK Support
+//!
+//! The library supports VSOCK transport for environments where TCP/IP is not available:
+//!
+//! ```ignore
+//! // Requires the "vsock" feature
+//! # use rkik_nts::{NtsClient, NtsClientConfig};
+//! # use rkik_nts::config::{VsockConfig, VsockDatagramConfig};
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Use VSOCK for NTS-KE handshake (stream mode)
+//! let config = NtsClientConfig::new("time.cloudflare.com")
+//!     .with_vsock(VsockConfig::new(VsockConfig::HOST_CID, 8443));
+//!
+//! // Use VSOCK datagram proxy for NTP time sync packets
+//! let config = NtsClientConfig::new("time.cloudflare.com")
+//!     .with_vsock(VsockConfig::with_conproto(VsockConfig::HOST_CID, 8443))
+//!     .with_vsock_datagram(VsockDatagramConfig::with_host_cid());
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Certificate Information
 //!
 //! Access TLS certificate information from the NTS-KE handshake:
@@ -112,13 +136,20 @@
 mod cipher;
 pub mod client;
 pub mod config;
+pub(crate) mod conproto;
 pub mod error;
 mod nts_ke;
 pub(crate) mod nts_ntp;
 pub mod types;
+pub(crate) mod transport;
+
+#[cfg(feature = "vsock")]
+pub mod vsock_datagram_transport;
 
 // Re-export main types for convenience
 pub use client::{NtsClient, NtsKeInfo};
 pub use config::NtsClientConfig;
+#[cfg(feature = "vsock")]
+pub use config::{VsockConfig, VsockDatagramConfig, NtpServerInfo};
 pub use error::{Error, Result};
-pub use types::{CertificateInfo, TimeSnapshot};
+pub use types::{CertificateInfo, TimeSnapshot, NtpServerDestination};

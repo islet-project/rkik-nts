@@ -1,11 +1,14 @@
 //! Common types used throughout the library.
 
+use std::net::SocketAddr;
 use std::time::SystemTime;
 
 use crate::cipher::AeadCipher;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+use crate::config::NtpServerInfo;
 
 /// Certificate information from the NTS-KE TLS handshake
 #[derive(Debug, Clone)]
@@ -40,6 +43,45 @@ pub struct CertificateInfo {
 
     /// Whether the certificate is self-signed
     pub is_self_signed: bool,
+}
+
+/// NTP server information that can be either a socket address or hostname.
+///
+/// This is used to support both direct UDP (with SocketAddr) and
+/// vsock datagram proxy mode (with hostname).
+#[derive(Debug, Clone)]
+pub enum NtpServerDestination {
+    /// Direct socket address for standard UDP mode.
+    SocketAddr(SocketAddr),
+    /// Hostname and port for vsock datagram proxy mode.
+    #[cfg(feature = "vsock")]
+    Hostname(NtpServerInfo),
+    /// Hostname and port for non-vsock mode (deferred DNS resolution).
+    #[cfg(not(feature = "vsock"))]
+    Hostname(NtpServerInfo),
+}
+
+impl NtpServerDestination {
+    /// Get the socket address if available.
+    pub fn as_socket_addr(&self) -> Option<SocketAddr> {
+        match self {
+            NtpServerDestination::SocketAddr(addr) => Some(*addr),
+            NtpServerDestination::Hostname(_) => None,
+        }
+    }
+
+    /// Get the hostname info if available.
+    pub fn as_hostname(&self) -> Option<&NtpServerInfo> {
+        match self {
+            NtpServerDestination::SocketAddr(_) => None,
+            NtpServerDestination::Hostname(info) => Some(info),
+        }
+    }
+
+    /// Check if this is a hostname-based destination.
+    pub fn is_hostname(&self) -> bool {
+        matches!(self, NtpServerDestination::Hostname(_))
+    }
 }
 
 /// Result of a time synchronization query.
@@ -94,12 +136,14 @@ impl TimeSnapshot {
 /// This struct holds all the information needed for NTS-protected NTP
 /// communication, including the cryptographic keys, cookies, and server
 /// information negotiated during the NTS-KE handshake.
+///
+/// The NTP server is stored as a hostname and port. Address resolution
+/// is deferred until `get_time()` is called, allowing the vsock proxy
+/// to handle DNS resolution when needed.
 pub struct NtsKeResult {
-    /// The NTP server to use for time queries.
-    pub ntp_server: std::net::SocketAddr,
-
-    /// All resolved NTP server addresses to try for time queries.
-    pub(crate) ntp_server_addrs: Vec<std::net::SocketAddr>,
+    /// The NTP server to use for time queries (hostname and port).
+    /// Address resolution is deferred until `get_time()` is called.
+    pub ntp_server: NtpServerDestination,
 
     /// The negotiated AEAD algorithm.
     pub aead_algorithm: String,
@@ -125,7 +169,6 @@ impl std::fmt::Debug for NtsKeResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NtsKeResult")
             .field("ntp_server", &self.ntp_server)
-            .field("ntp_server_addrs", &self.ntp_server_addrs)
             .field("aead_algorithm", &self.aead_algorithm)
             .field("cookies", &format!("[{} cookies]", self.cookies.len()))
             .field("ke_duration", &self.ke_duration)
@@ -177,6 +220,11 @@ impl NtsKeResult {
     pub(crate) fn into_nts_state(self) -> crate::nts_ntp::NtsState {
         crate::nts_ntp::NtsState::new(self.c2s, self.s2c, self.cookies)
     }
+
+    /// Get the NTP server destination.
+    pub fn ntp_server_destination(&self) -> &NtpServerDestination {
+        &self.ntp_server
+    }
 }
 
 #[cfg(test)]
@@ -223,21 +271,26 @@ mod tests {
     }
 
     #[test]
-    fn test_nts_ke_result_cookie_count() {
-        // Test cookie_count and has_cookies without creating full NtsKeResult
-        // since SourceNtsData doesn't have a public constructor
-        let cookies = [vec![1, 2, 3, 4], vec![5, 6, 7, 8, 9]];
-        assert_eq!(cookies.len(), 2);
-        assert!(!cookies.is_empty());
+    fn test_ntp_server_destination_socket_addr() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 123);
+        let dest = NtpServerDestination::SocketAddr(addr);
 
-        let sizes: Vec<usize> = cookies.iter().map(|c| c.len()).collect();
-        assert_eq!(sizes, vec![4, 5]);
+        assert_eq!(dest.as_socket_addr(), Some(addr));
+        #[cfg(feature = "vsock")]
+        assert!(dest.as_hostname().is_none());
+        #[cfg(feature = "vsock")]
+        assert!(!dest.is_hostname());
     }
 
+    #[cfg(feature = "vsock")]
     #[test]
-    fn test_nts_ke_result_empty_cookies() {
-        let cookies: Vec<Vec<u8>> = vec![];
-        assert_eq!(cookies.len(), 0);
-        assert!(cookies.is_empty());
+    fn test_ntp_server_destination_hostname() {
+        let info = NtpServerInfo::new("time.cloudflare.com", 123);
+        let dest = NtpServerDestination::Hostname(info.clone());
+
+        assert!(dest.as_socket_addr().is_none());
+        assert_eq!(dest.as_hostname(), Some(&info));
+        assert!(dest.is_hostname());
     }
 }

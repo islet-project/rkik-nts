@@ -18,19 +18,24 @@ tokio = { version = "1.40", features = ["net", "time", "rt-multi-thread", "macro
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.8"
+rustls-pemfile = "2.2"
 webpki-roots = "1.0.4"
 thiserror = "2.0.17"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = "1.0"
 x509-parser = "0.18"
 sha2 = "0.10"
 chrono = "0.4"
 zeroize = "1.8"
-
+tokio-vsock = { version = "0.7", optional = true }
+vsock = "0.5.0"
 [dev-dependencies]
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 
 [features]
 default = []
@@ -39,6 +44,7 @@ tracing-subscriber = ["dep:tracing-subscriber"]
 network-tests = []
 tls-keylog = []
 dangerous-configuration = []
+vsock = ["dep:tokio-vsock", "dep:serde"]
 
 [lib]
 name = "rkik_nts"
@@ -73,3 +79,8 @@ required-features = ["tracing-subscriber"]
 name = "nts_end_to_end"
 path = "examples/nts_end_to_end.rs"
 required-features = ["tracing-subscriber"]
+
+[[example]]
+name = "nts_vsock_client"
+path = "examples/nts_vsock_client.rs"
+required-features = ["tracing-subscriber", "vsock"]
