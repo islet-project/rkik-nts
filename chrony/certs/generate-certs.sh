@@ -1,20 +1,16 @@
 #!/bin/bash
 
-# Generate private key and X.509 self-signed certificate for chrony NTS
-# with Subject Alternative Names for the specified IP addresses
-
 set -e
 
-# Configuration
-KEY_FILE="server.key"
-CERT_FILE="server.crt"
-DAYS_VALID=365
+KEY_FILE="nts-devel.key"
+CERT_FILE="nts-devel.crt"
+DAYS_VALID=$((365*5))
 
 # Generate private key (RSA 2048 bits)
 echo "Generating private key..."
 openssl genrsa -out "$KEY_FILE" 2048
 
-# Generate self-signed certificate with SANs
+# Generate self-signed certificate for the purposes of Islet/AVF development
 echo "Generating self-signed certificate..."
 openssl req -new -x509 \
     -key "$KEY_FILE" \
