@@ -22,8 +22,8 @@ use zeroize::Zeroizing;
 use crate::cipher::{AeadCipher, AEAD_AES_SIV_CMAC_256, AEAD_AES_SIV_CMAC_512};
 use crate::config::NtsClientConfig;
 use crate::error::{Error, Result};
-use crate::types::{CertificateInfo, NtsKeResult, NtpServerDestination};
 use crate::transport::establish_transport;
+use crate::types::{CertificateInfo, NtpServerDestination, NtsKeResult};
 
 #[cfg(feature = "vsock")]
 use crate::config::NtpServerConfig;
@@ -57,7 +57,11 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
     let ke_start = std::time::Instant::now();
 
     #[cfg(feature = "vsock")]
-    let transport_type = if config.vsock_config.is_some() { "VSOCK" } else { "TCP" };
+    let transport_type = if config.vsock_config.is_some() {
+        "VSOCK"
+    } else {
+        "TCP"
+    };
     #[cfg(not(feature = "vsock"))]
     let transport_type = "TCP";
 
@@ -82,11 +86,13 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
     let transport_stream = establish_transport(config).await?;
 
     // Perform TLS handshake over the transport
-    let mut tls_stream =
-        tokio::time::timeout(config.timeout, connector.connect(server_name, transport_stream))
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|e| Error::Tls(format!("TLS handshake failed: {e}")))?;
+    let mut tls_stream = tokio::time::timeout(
+        config.timeout,
+        connector.connect(server_name, transport_stream),
+    )
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map_err(|e| Error::Tls(format!("TLS handshake failed: {e}")))?;
 
     debug!("TLS handshake complete");
 
@@ -350,7 +356,10 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
         }
     };
 
-    fn extract_ntp_server_from_state(state: &NtsKeParseState, nts_ke_server: &str) -> NtpServerDestination {
+    fn extract_ntp_server_from_state(
+        state: &NtsKeParseState,
+        nts_ke_server: &str,
+    ) -> NtpServerDestination {
         let ntp_host = state
             .ntp_server
             .clone()
@@ -365,12 +374,8 @@ pub(crate) async fn perform_nts_ke(config: &NtsClientConfig) -> Result<NtsKeResu
     let ntp_server_destination = if let Some(server_config) = &config.ntp_server {
         // Use the configured server
         match server_config {
-            NtpServerConfig::SocketAddr(addr) => {
-                NtpServerDestination::SocketAddr(*addr)
-            }
-            NtpServerConfig::Hostname(info) => {
-                NtpServerDestination::Hostname(info.clone())
-            }
+            NtpServerConfig::SocketAddr(addr) => NtpServerDestination::SocketAddr(*addr),
+            NtpServerConfig::Hostname(info) => NtpServerDestination::Hostname(info.clone()),
         }
     } else {
         extract_ntp_server_from_state(&state, &config.nts_ke_server)
@@ -530,7 +535,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
 
         // Certificate doesn't match any pinned certificate
         Err(rustls::Error::InvalidCertificate(
-            rustls::CertificateError::UnknownIssuer
+            rustls::CertificateError::UnknownIssuer,
         ))
     }
 
@@ -645,7 +650,9 @@ fn load_pinned_certs(cert_paths: &[std::path::PathBuf]) -> Result<Vec<Certificat
     }
 
     if certs.is_empty() {
-        return Err(Error::Tls("No certificates found in pinned cert files".to_string()));
+        return Err(Error::Tls(
+            "No certificates found in pinned cert files".to_string(),
+        ));
     }
 
     Ok(certs)
@@ -673,7 +680,10 @@ fn build_tls_config(
 
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
         if let Some(pinned_cert_paths) = &config.pinned_certs {
-            info!("Using certificate pinning with {} cert file(s)", pinned_cert_paths.len());
+            info!(
+                "Using certificate pinning with {} cert file(s)",
+                pinned_cert_paths.len()
+            );
             let pinned_certs = load_pinned_certs(pinned_cert_paths)?;
             let pinned_verifier = PinnedCertVerifier::new(pinned_certs);
             Arc::new(CapturingVerifier {
@@ -740,8 +750,7 @@ fn load_root_certs(config: &NtsClientConfig) -> rustls::RootCertStore {
     for ca_path in &config.additional_ca_certs {
         match std::fs::read(ca_path) {
             Ok(cert_data) => {
-                let parsed_certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-                    .collect();
+                let parsed_certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..]).collect();
                 for cert_result in parsed_certs {
                     match cert_result {
                         Ok(cert) => {

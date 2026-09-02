@@ -277,7 +277,8 @@ impl NtsClient {
                         self.config.max_retries,
                         self.config.timeout,
                         ntp_server_destination,
-                    ).await;
+                    )
+                    .await;
                 } else {
                     return Err(Error::Other(
                         "VSOCK datagram transport not initialized".to_string(),
@@ -291,11 +292,13 @@ impl NtsClient {
             NtpServerDestination::SocketAddr(addr) => vec![*addr],
             #[cfg(feature = "vsock")]
             NtpServerDestination::Hostname(info) => {
-                crate::transport::resolve_server(&info.hostname, info.port, self.config.timeout).await?
+                crate::transport::resolve_server(&info.hostname, info.port, self.config.timeout)
+                    .await?
             }
             #[cfg(not(feature = "vsock"))]
             NtpServerDestination::Hostname(info) => {
-                crate::transport::resolve_server(&info.hostname, info.port, self.config.timeout).await?
+                crate::transport::resolve_server(&info.hostname, info.port, self.config.timeout)
+                    .await?
             }
         };
 
@@ -326,7 +329,8 @@ impl NtsClient {
 
             if filtered_addrs.is_empty() {
                 return Err(Error::ServerUnavailable(
-                    "no NTP server addresses are compatible with the bound socket family".to_string(),
+                    "no NTP server addresses are compatible with the bound socket family"
+                        .to_string(),
                 ));
             }
 
@@ -340,7 +344,8 @@ impl NtsClient {
                 self.config.max_retries,
                 self.config.timeout,
                 ntp_server_destination,
-            ).await;
+            )
+            .await;
         }
 
         let socket = self.socket.as_ref().unwrap();
@@ -365,7 +370,8 @@ impl NtsClient {
             self.config.max_retries,
             self.config.timeout,
             ntp_server_destination,
-        ).await
+        )
+        .await
     }
 
     /// Send NTP requests in VSOCK datagram mode with retry logic.
@@ -393,21 +399,27 @@ impl NtsClient {
                 server_info.port
             );
 
-            let response = match tokio::time::timeout(op_timeout, transport.send_to(server_info, &request)).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(err)) => {
-                    nts_state.abandon_request();
-                    last_error = Some(err);
-                    continue;
-                }
-                Err(_) => {
-                    nts_state.abandon_request();
-                    last_error = Some(Error::Timeout);
-                    continue;
-                }
-            };
+            let response =
+                match tokio::time::timeout(op_timeout, transport.send_to(server_info, &request))
+                    .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(err)) => {
+                        nts_state.abandon_request();
+                        last_error = Some(err);
+                        continue;
+                    }
+                    Err(_) => {
+                        nts_state.abandon_request();
+                        last_error = Some(Error::Timeout);
+                        continue;
+                    }
+                };
 
-            debug!("Received {} bytes response via VSOCK datagram", response.len());
+            debug!(
+                "Received {} bytes response via VSOCK datagram",
+                response.len()
+            );
 
             match nts_state.parse_response(&response) {
                 Ok(response) => {

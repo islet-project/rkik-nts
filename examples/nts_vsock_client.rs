@@ -36,7 +36,11 @@ fn set_system_time(network_time: Duration) -> Result<(), Box<dyn Error>> {
         println!("✓ System time updated successfully");
         Ok(())
     } else {
-        Err(format!("Failed to set system time: {}", std::io::Error::last_os_error()).into())
+        Err(format!(
+            "Failed to set system time: {}",
+            std::io::Error::last_os_error()
+        )
+        .into())
     }
 }
 
@@ -151,9 +155,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Print configuration
     println!("Configuration:");
-    println!("  NTS-KE Server: {}:{}" , args.nts_server, args.nts_port);
-    println!("  VSOCK Datagram: CID={}, Port={}", u32::from(args.vsock_datagram_cid), args.vsock_datagram_port);
-    println!("  VSOCK Stream: CID={}, Port={}", u32::from(args.vsock_stream_cid), args.vsock_stream_port);
+    println!("  NTS-KE Server: {}:{}", args.nts_server, args.nts_port);
+    println!(
+        "  VSOCK Datagram: CID={}, Port={}",
+        u32::from(args.vsock_datagram_cid),
+        args.vsock_datagram_port
+    );
+    println!(
+        "  VSOCK Stream: CID={}, Port={}",
+        u32::from(args.vsock_stream_cid),
+        args.vsock_stream_port
+    );
     println!("  Conproto: {}", args.conproto);
     if !args.ca_cert_path.is_empty() {
         println!("  Additional CA Certificates:");
@@ -186,7 +198,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Configure VSOCK datagram transport for NTP time sync
-    let datagram_config = VsockDatagramConfig::new(u32::from(args.vsock_datagram_cid), args.vsock_datagram_port);
+    let datagram_config =
+        VsockDatagramConfig::new(u32::from(args.vsock_datagram_cid), args.vsock_datagram_port);
     config = config.with_vsock_datagram(datagram_config);
 
     // Configure VSOCK stream transport for NTS-KE handshake
@@ -244,13 +257,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Calculate the target system time using the network time from the response
                 // network_time is the corrected time from the NTP server
-                let network_time_duration = time.network_time
+                let network_time_duration = time
+                    .network_time
                     .duration_since(UNIX_EPOCH)
                     .map_err(|e| format!("Invalid network time: {}", e))?;
 
                 if let Err(e) = set_system_time(network_time_duration) {
                     eprintln!("  Error setting system time: {}", e);
-                    eprintln!("  Note: Setting system time requires root/administrator privileges.");
+                    eprintln!(
+                        "  Note: Setting system time requires root/administrator privileges."
+                    );
                     return Err(e);
                 }
             }

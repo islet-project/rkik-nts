@@ -59,10 +59,7 @@ impl DatagramHeader {
     /// Returns (header, header_size) where header_size includes hostname_len + hostname + port + payload_len
     pub fn from_bytes(data: &[u8]) -> io::Result<(Self, usize)> {
         if data.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Empty packet",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty packet"));
         }
 
         let hostname_len = data[0] as usize;
@@ -77,17 +74,20 @@ impl DatagramHeader {
         if data.len() < header_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Header too short: expected at least {} bytes, got {}", header_size, data.len()),
+                format!(
+                    "Header too short: expected at least {} bytes, got {}",
+                    header_size,
+                    data.len()
+                ),
             ));
         }
 
-        let hostname = String::from_utf8(data[1..1 + hostname_len].to_vec())
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid hostname UTF-8: {}", e),
-                )
-            })?;
+        let hostname = String::from_utf8(data[1..1 + hostname_len].to_vec()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid hostname UTF-8: {}", e),
+            )
+        })?;
 
         let port_start = 1 + hostname_len;
         let port = u16::from_be_bytes([data[port_start], data[port_start + 1]]);
@@ -100,7 +100,14 @@ impl DatagramHeader {
             data[payload_len_start + 3],
         ]);
 
-        Ok((DatagramHeader { hostname, port, payload_len }, header_size))
+        Ok((
+            DatagramHeader {
+                hostname,
+                port,
+                payload_len,
+            },
+            header_size,
+        ))
     }
 
     /// Reads a complete frame from a stream
@@ -124,13 +131,12 @@ impl DatagramHeader {
         // Read hostname
         let mut hostname_buf = vec![0u8; hostname_len];
         reader.read_exact(&mut hostname_buf).await?;
-        let hostname = String::from_utf8(hostname_buf)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid hostname UTF-8: {}", e),
-                )
-            })?;
+        let hostname = String::from_utf8(hostname_buf).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid hostname UTF-8: {}", e),
+            )
+        })?;
 
         // Read port (2 bytes, big-endian)
         let mut port_buf = [0u8; 2];
@@ -213,15 +219,12 @@ impl VsockDatagramTransport {
         );
 
         // Connect to the vsock proxy
-        let mut stream = tokio::time::timeout(
-            self.timeout,
-            VsockStream::connect(self.proxy_addr),
-        )
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|e| {
-            Error::ServerUnavailable(format!("VSOCK datagram proxy connection failed: {e}"))
-        })?;
+        let mut stream = tokio::time::timeout(self.timeout, VsockStream::connect(self.proxy_addr))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|e| {
+                Error::ServerUnavailable(format!("VSOCK datagram proxy connection failed: {e}"))
+            })?;
 
         // Create header with server info
         let header = DatagramHeader {
@@ -249,7 +252,8 @@ impl VsockDatagramTransport {
 
         debug!(
             "Received NTP response {:?}, {} bytes of payload",
-            response_header, response_payload.len()
+            response_header,
+            response_payload.len()
         );
 
         Ok(response_payload)

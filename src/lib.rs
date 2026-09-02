@@ -140,8 +140,8 @@ pub(crate) mod conproto;
 pub mod error;
 mod nts_ke;
 pub(crate) mod nts_ntp;
-pub mod types;
 pub(crate) mod transport;
+pub mod types;
 
 #[cfg(feature = "vsock")]
 pub mod vsock_datagram_transport;
@@ -150,6 +150,6 @@ pub mod vsock_datagram_transport;
 pub use client::{NtsClient, NtsKeInfo};
 pub use config::NtsClientConfig;
 #[cfg(feature = "vsock")]
-pub use config::{VsockConfig, VsockDatagramConfig, NtpServerInfo};
+pub use config::{NtpServerInfo, VsockConfig, VsockDatagramConfig};
 pub use error::{Error, Result};
-pub use types::{CertificateInfo, TimeSnapshot, NtpServerDestination};
+pub use types::{CertificateInfo, NtpServerDestination, TimeSnapshot};

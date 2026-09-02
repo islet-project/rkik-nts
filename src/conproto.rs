@@ -97,7 +97,9 @@ pub async fn connect(
 
     let response = tokio::time::timeout(timeout_dur, receive_response(stream))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Proxy response timeout"))??;
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "Proxy response timeout")
+        })??;
 
     if response.status != "SUCCESS" {
         return Err(format!("Proxy connection failed: {:?}", response.reason).into());
