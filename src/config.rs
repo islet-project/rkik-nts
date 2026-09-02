@@ -308,7 +308,9 @@ impl NtsClientConfig {
     /// Set a specific NTP server to use using hostname and port.
     #[cfg(feature = "vsock")]
     pub fn with_ntp_server_hostname(mut self, hostname: impl Into<String>, port: u16) -> Self {
-        self.ntp_server = Some(NtpServerConfig::Hostname(NtpServerInfo::new(hostname, port)));
+        self.ntp_server = Some(NtpServerConfig::Hostname(NtpServerInfo::new(
+            hostname, port,
+        )));
         self
     }
 
@@ -353,7 +355,8 @@ impl NtsClientConfig {
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
-        self.additional_ca_certs.extend(paths.into_iter().map(Into::into));
+        self.additional_ca_certs
+            .extend(paths.into_iter().map(Into::into));
         self
     }
 

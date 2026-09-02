@@ -88,13 +88,10 @@ pub async fn establish_vsock_transport(config: &NtsClientConfig) -> Result<Trans
         vsock_config.cid, vsock_config.port
     );
     let vsock_addr = VsockAddr::new(vsock_config.cid, vsock_config.port);
-    let mut vsock_stream = tokio::time::timeout(
-        config.timeout,
-        VsockStream::connect(vsock_addr),
-    )
-    .await
-    .map_err(|_| Error::Timeout)?
-    .map_err(|e| Error::ServerUnavailable(format!("VSOCK connection failed: {e}")))?;
+    let mut vsock_stream = tokio::time::timeout(config.timeout, VsockStream::connect(vsock_addr))
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::ServerUnavailable(format!("VSOCK connection failed: {e}")))?;
 
     // If conproto is enabled, send the target server address to the proxy
     if vsock_config.conproto {
@@ -137,14 +134,17 @@ async fn establish_tcp_transport(config: &NtsClientConfig) -> Result<TransportSt
         config.nts_ke_server, config.nts_ke_port
     );
 
-    let server_addrs = resolve_server(&config.nts_ke_server, config.nts_ke_port, config.timeout).await?;
+    let server_addrs =
+        resolve_server(&config.nts_ke_server, config.nts_ke_port, config.timeout).await?;
     debug!("Resolved NTS-KE server addresses: {server_addrs:?}");
 
     let mut last_connect_error = None;
     let mut tcp_stream = None;
 
     for server_addr in &server_addrs {
-        match tokio::time::timeout(config.timeout, tokio::net::TcpStream::connect(server_addr)).await {
+        match tokio::time::timeout(config.timeout, tokio::net::TcpStream::connect(server_addr))
+            .await
+        {
             Ok(Ok(stream)) => {
                 tcp_stream = Some(stream);
                 break;
